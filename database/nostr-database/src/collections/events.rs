@@ -2,9 +2,9 @@
 // Copyright (c) 2023-2025 Rust Nostr Developers
 // Distributed under the MIT software license
 
-use std::collections::btree_set::IntoIter;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::vec::IntoIter;
 
 use nostr::{Event, Filter};
 
@@ -13,10 +13,14 @@ use super::tree::{BTreeCappedSet, Capacity, OverCapacityPolicy};
 // Lookup ID: EVENT_ORD_IMPL
 const POLICY: OverCapacityPolicy = OverCapacityPolicy::Last;
 
-/// Descending sorted collection of events
+/// Descending sorted collection of events.
+///
+/// Search filters preserve insertion order so callers can return ranked results.
 #[derive(Debug, Clone)]
 pub struct Events {
     set: BTreeCappedSet<Event>,
+    ordered: Option<Vec<Event>>,
+    ordered_limit: Option<usize>,
     hash: u64,
     prev_not_match: bool,
 }
@@ -25,6 +29,8 @@ impl Default for Events {
     fn default() -> Self {
         Self {
             set: BTreeCappedSet::unbounded(),
+            ordered: None,
+            ordered_limit: None,
             hash: 0,
             prev_not_match: false,
         }
@@ -33,7 +39,7 @@ impl Default for Events {
 
 impl PartialEq for Events {
     fn eq(&self, other: &Self) -> bool {
-        self.set == other.set
+        self.iter().eq(other.iter())
     }
 }
 
@@ -47,13 +53,22 @@ impl Events {
         filter.hash(&mut hasher);
         let hash: u64 = hasher.finish();
 
-        let set: BTreeCappedSet<Event> = match filter.limit {
-            Some(limit) => BTreeCappedSet::bounded_with_policy(limit, POLICY),
-            None => BTreeCappedSet::unbounded(),
+        let ordered = filter.search.as_ref().map(|_| Vec::new());
+        let ordered_limit = if ordered.is_some() { filter.limit } else { None };
+
+        let set: BTreeCappedSet<Event> = if ordered.is_some() {
+            BTreeCappedSet::unbounded()
+        } else {
+            match filter.limit {
+                Some(limit) => BTreeCappedSet::bounded_with_policy(limit, POLICY),
+                None => BTreeCappedSet::unbounded(),
+            }
         };
 
         Self {
             set,
+            ordered,
+            ordered_limit,
             hash,
             prev_not_match: false,
         }
@@ -62,19 +77,28 @@ impl Events {
     /// Returns the number of events in the collection.
     #[inline]
     pub fn len(&self) -> usize {
-        self.set.len()
+        match &self.ordered {
+            Some(events) => events.len(),
+            None => self.set.len(),
+        }
     }
 
     /// Checks if there are no events.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        match &self.ordered {
+            Some(events) => events.is_empty(),
+            None => self.set.is_empty(),
+        }
     }
 
     /// Check if contains [`Event`]
     #[inline]
     pub fn contains(&self, event: &Event) -> bool {
-        self.set.contains(event)
+        match &self.ordered {
+            Some(events) => events.iter().any(|candidate| candidate.id == event.id),
+            None => self.set.contains(event),
+        }
     }
 
     /// Insert [`Event`]
@@ -84,6 +108,10 @@ impl Events {
     /// Use [`Events::force_insert`] to always make sure the event is inserted.
     #[inline]
     pub fn insert(&mut self, event: Event) -> bool {
+        if self.ordered.is_some() {
+            return self.insert_ordered(event, false);
+        }
+
         self.set.insert(event).inserted
     }
 
@@ -93,6 +121,10 @@ impl Events {
     /// If the collection capacity is full, this method will increase it.
     #[inline]
     pub fn force_insert(&mut self, event: Event) -> bool {
+        if self.ordered.is_some() {
+            return self.insert_ordered(event, true);
+        }
+
         self.set.force_insert(event).inserted
     }
 
@@ -102,7 +134,13 @@ impl Events {
     where
         I: IntoIterator<Item = Event>,
     {
-        self.set.extend(events);
+        if self.ordered.is_some() {
+            for event in events {
+                self.insert(event);
+            }
+        } else {
+            self.set.extend(events);
+        }
     }
 
     /// Merge events collections into a single one.
@@ -113,66 +151,104 @@ impl Events {
     pub fn merge(mut self, other: Self) -> Self {
         // Hash not match -> change capacity to unbounded
         if self.hash != other.hash || self.prev_not_match || other.prev_not_match {
-            self.set.change_capacity(Capacity::Unbounded);
+            if self.ordered.is_some() {
+                self.ordered_limit = None;
+            } else {
+                self.set.change_capacity(Capacity::Unbounded);
+            }
             self.hash = 0;
             self.prev_not_match = true;
         }
 
         // Extend
-        self.extend(other.set);
+        self.extend(other);
 
         self
     }
 
-    /// Get first [`Event`] (descending order)
+    /// Get first [`Event`]
     #[inline]
     pub fn first(&self) -> Option<&Event> {
-        // Lookup ID: EVENT_ORD_IMPL
-        self.set.first()
+        match &self.ordered {
+            Some(events) => events.first(),
+            None => {
+                // Lookup ID: EVENT_ORD_IMPL
+                self.set.first()
+            }
+        }
     }
 
-    /// Get first [`Event`] (descending order)
+    /// Get first [`Event`]
     #[inline]
     pub fn first_owned(self) -> Option<Event> {
-        // Lookup ID: EVENT_ORD_IMPL
         self.into_iter().next()
     }
 
-    /// Get last [`Event`] (descending order)
+    /// Get last [`Event`]
     #[inline]
     pub fn last(&self) -> Option<&Event> {
-        // Lookup ID: EVENT_ORD_IMPL
-        self.set.last()
+        match &self.ordered {
+            Some(events) => events.last(),
+            None => {
+                // Lookup ID: EVENT_ORD_IMPL
+                self.set.last()
+            }
+        }
     }
 
-    /// Get last [`Event`] (descending order)
+    /// Get last [`Event`]
     #[inline]
     pub fn last_owned(self) -> Option<Event> {
-        // Lookup ID: EVENT_ORD_IMPL
         self.into_iter().next_back()
     }
 
-    /// Iterate events in descending order
+    /// Iterate events.
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &Event> {
-        // Lookup ID: EVENT_ORD_IMPL
-        self.set.iter()
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &Event> + '_> {
+        match &self.ordered {
+            Some(events) => Box::new(events.iter()),
+            None => {
+                // Lookup ID: EVENT_ORD_IMPL
+                Box::new(self.set.iter())
+            }
+        }
     }
 
     /// Convert the collection to vector of events.
     #[inline]
     pub fn to_vec(self) -> Vec<Event> {
-        self.into_iter().collect()
+        match self.ordered {
+            Some(events) => events,
+            None => self.set.into_iter().collect(),
+        }
+    }
+
+    fn insert_ordered(&mut self, event: Event, force: bool) -> bool {
+        let events = self.ordered.as_mut().expect("ordered mode must exist");
+
+        if events.iter().any(|candidate| candidate.id == event.id) {
+            return false;
+        }
+
+        if !force {
+            if let Some(limit) = self.ordered_limit {
+                if events.len() >= limit {
+                    return false;
+                }
+            }
+        }
+
+        events.push(event);
+        true
     }
 }
 
 impl IntoIterator for Events {
     type Item = Event;
-    type IntoIter = IntoIter<Self::Item>;
+    type IntoIter = IntoIter<Event>;
 
     fn into_iter(self) -> Self::IntoIter {
-        // Lookup ID: EVENT_ORD_IMPL
-        self.set.into_iter()
+        self.to_vec().into_iter()
     }
 }
 
@@ -303,5 +379,23 @@ mod tests {
         assert_eq!(events.hash, 0);
         assert!(events.prev_not_match);
         assert_eq!(events.set.capacity(), Capacity::Unbounded);
+    }
+
+    #[test]
+    fn test_search_events_preserve_insertion_order() {
+        let mut filter = Filter::new().kind(Kind::Metadata).limit(10);
+        filter.search = Some("jack".to_owned());
+
+        let event1 = Event::from_json(r#"{"content":"Kind 10050 is for DMs, kind 10002 for the other stuff. But both have the same aim. So IMO both have to be under the `gossip` option.","created_at":1732738371,"id":"f2d71a515ce3576d238aaaeaa48fde97388162d08208f729b540a4c3f9723e6b","kind":1,"pubkey":"68d81165918100b7da43fc28f7d1fc12554466e1115886b9e7bb326f65ec4272","sig":"d88d3ac21036cfb541809288c12844747dbf1d20a246133dbd37374254b281808c5582bade27c880477759491b2b964d7235142c8b80d233dfb9ae8a50252119","tags":[["e","8262a50cf7832351ae3f21c429e111bb31be0cf754ec437e015534bf5cc2eee8","","root"],["e","0f4bcc83ef2af2febbc7eb9aea5d615a29084ed9e65c467ef2a9387ff79b57e8"],["e","94469431e367b2c16e6d224a4ac2c369c18718a1abdf42759ff591d9816b5ff3","","reply"],["p","68d81165918100b7da43fc28f7d1fc12554466e1115886b9e7bb326f65ec4272"],["p","1739d937dc8c0c7370aa27585938c119e25c41f6c441a5d34c6d38503e3136ef"],["p","03f9cfd948e95aeb04f780382344f7c1cfc0210d9af3f4006bb6d451c7b08692"],["p","126103bfddc8df256b6e0abfd7f3797c80dcc4ea88f7c2f87dd4104220b4d65f"],["p","13a665157257e79d9dcc960deeb367fd79383be2d0babb3d861679a5701d463b"],["p","ee0d20b47fb298e8a9ed3609108fe7f2296bd71e8b82fb4f9ff8f61f62bbc7a6"],["p","1c71312fb45273956b078e27981dcc15b178db8d55bffd7ad57a8cfaed6b5ab4"],["p","800e0fe3d8638ce3f75a56ed865df9d96fc9d9cd2f75550df0d7f5c1d8468b0b"]]}"#).unwrap();
+        let event2 = Event::from_json(r#"{"content":"Thank you !","created_at":1732738224,"id":"035a18ba52a9b40137c0c60ed955eb1f1f93e12423082f6d8a83f62726462d21","kind":1,"pubkey":"1c71312fb45273956b078e27981dcc15b178db8d55bffd7ad57a8cfaed6b5ab4","sig":"54921c7a4f972428c67267a0d99df7d5094c7ca4d26fe9c08221de88ffafb0cab347939ff77129ecfdebad6b18cd2c4c229bf67ce8914fe778d24e19bc22be43","tags":[["p","68d81165918100b7da43fc28f7d1fc12554466e1115886b9e7bb326f65ec4272"],["p","1739d937dc8c0c7370aa27585938c119e25c41f6c441a5d34c6d38503e3136ef"],["p","03f9cfd948e95aeb04f780382344f7c1cfc0210d9af3f4006bb6d451c7b08692"],["p","126103bfddc8df256b6e0abfd7f3797c80dcc4ea88f7c2f87dd4104220b4d65f"],["p","13a665157257e79d9dcc960deeb367fd79383be2d0babb3d861679a5701d463b"],["p","ee0d20b47fb298e8a9ed3609108fe7f2296bd71e8b82fb4f9ff8f61f62bbc7a6"],["e","8262a50cf7832351ae3f21c429e111bb31be0cf754ec437e015534bf5cc2eee8","wss://nos.lol/","root"],["e","670303f9cbb24568c705b545c277be1f5172ad84795cc9e700aeea5bb248fd74","wss://n.ok0.org/","reply"]]}"#).unwrap();
+
+        let mut events = Events::new(&filter);
+        events.insert(event1.clone());
+        events.insert(event2.clone());
+
+        let ordered = events.to_vec();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].id, event1.id);
+        assert_eq!(ordered[1].id, event2.id);
     }
 }
