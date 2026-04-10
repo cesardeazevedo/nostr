@@ -27,6 +27,45 @@ use crate::error::Error;
 
 type WsTx<S> = SplitSink<WebSocketStream<S>, Message>;
 
+const AUTH_SEARCH_TOKEN_PREFIX: &str = "__auth:";
+
+fn is_authenticated_metadata_search(filter: &Filter) -> bool {
+    filter.search.is_some()
+        && filter
+            .kinds
+            .as_ref()
+            .is_some_and(|kinds| kinds.len() == 1 && kinds.contains(&Kind::Metadata))
+}
+
+fn inject_authenticated_search(filter: &mut Filter, authenticated_public_key: &PublicKey) {
+    let is_metadata_search = filter
+        .kinds
+        .as_ref()
+        .is_some_and(|kinds| kinds.len() == 1 && kinds.contains(&Kind::Metadata));
+
+    if !is_metadata_search {
+        return;
+    }
+
+    let Some(search) = filter.search.as_mut() else {
+        return;
+    };
+
+    if search
+        .split_whitespace()
+        .any(|token| token.starts_with(AUTH_SEARCH_TOKEN_PREFIX))
+    {
+        return;
+    }
+
+    if !search.is_empty() {
+        search.push(' ');
+    }
+
+    search.push_str(AUTH_SEARCH_TOKEN_PREFIX);
+    search.push_str(&authenticated_public_key.to_hex());
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct InnerLocalRelay {
     addr: SocketAddr,
@@ -562,13 +601,12 @@ impl InnerLocalRelay {
                         .await;
                 }
 
-                // Check NIP42
+                // Check NIP42 only for personalized metadata search requests
                 if let Some(nip42) = &self.nip42 {
                     // TODO: check if public key allowed
 
-                    // Check mode and if it's authenticated
-                    if nip42.mode.is_read() && !session.nip42.is_authenticated() {
-                        // Generate and send AUTH challenge
+                    let require_nip42_auth = nip42.mode.is_read() && is_authenticated_metadata_search(filter.as_ref());
+                    if require_nip42_auth && !session.nip42.is_authenticated() {
                         send_msg(
                             ws_tx,
                             RelayMessage::Auth {
@@ -577,7 +615,6 @@ impl InnerLocalRelay {
                         )
                         .await?;
 
-                        // Return error
                         return send_msg(
                                 ws_tx,
                                 RelayMessage::Closed {
@@ -606,7 +643,11 @@ impl InnerLocalRelay {
                     }
                 }
 
-                let filter: Filter = filter.into_owned();
+                let mut filter: Filter = filter.into_owned();
+
+                if let Some(authenticated_public_key) = &session.nip42.public_key {
+                    inject_authenticated_search(&mut filter, authenticated_public_key);
+                }
 
                 // Check if subscription has IDs
                 let ids_len: Option<usize> = filter.ids.as_ref().map(|ids| ids.len());
