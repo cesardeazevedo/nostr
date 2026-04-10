@@ -34,14 +34,14 @@ fn is_authenticated_metadata_search(filter: &Filter) -> bool {
         && filter
             .kinds
             .as_ref()
-            .is_some_and(|kinds| kinds.len() == 1 && kinds.contains(&Kind::Metadata))
+            .is_some_and(|kinds| kinds.contains(&Kind::Metadata))
 }
 
 fn inject_authenticated_search(filter: &mut Filter, authenticated_public_key: &PublicKey) {
     let is_metadata_search = filter
         .kinds
         .as_ref()
-        .is_some_and(|kinds| kinds.len() == 1 && kinds.contains(&Kind::Metadata));
+        .is_some_and(|kinds| kinds.contains(&Kind::Metadata));
 
     if !is_metadata_search {
         return;
@@ -686,16 +686,19 @@ impl InnerLocalRelay {
                 json_msgs.push(RelayMessage::EndOfStoredEvents(Cow::Borrowed(subscription_id.as_ref())).as_json());
 
                 match ids_len {
-                    // Requested IDs len is the same as the query output, close the subscription.
                     Some(ids_len) if ids_len == events_len => {
                         json_msgs.push(RelayMessage::Closed {
                             subscription_id,
                             message: Cow::Borrowed(""),
                         }.as_json());
                     },
-                    // The stored events are all served, but miss some: save the subscription.
+                    _ if filter.search.is_some() => {
+                        json_msgs.push(RelayMessage::Closed {
+                            subscription_id,
+                            message: Cow::Borrowed(""),
+                        }.as_json());
+                    }
                     _ => {
-                        // Save the subscription
                         session
                             .subscriptions
                             .insert(subscription_id.clone().into_owned(), filter);
